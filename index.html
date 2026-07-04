@@ -301,6 +301,19 @@ async function listChildren(url, path, token) {
   return entries;
 }
 
+// Get the folder name a shared link points to (for the default nickname).
+async function getSharedLinkName(url, token) {
+  try {
+    const res = await dbxFetch("https://api.dropboxapi.com/2/sharing/get_shared_link_metadata", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    if (!res.ok) return "";
+    return (await res.json()).name || "";
+  } catch { return ""; }
+}
+
 // Walk a shared link folder-by-folder, computing the newest file date inside
 // each TOP-LEVEL subfolder (searching all the way down). Returns folder records.
 async function scanLink(url, token, onProgress) {
@@ -596,7 +609,7 @@ function renderResults() {
         </div>
         <div class="meta">${f.newest ? "newest: " + fmtDate(f.newest) : "no files"}</div>
         <div class="actions">
-          ${f.isRoot ? "" : '<button class="act zip-btn">Zip ⬇</button>'}
+          ${f.isRoot ? "" : '<button class="act zip-btn" title="Zip and download the contents of this folder">Zip ⬇</button>'}
           ${f.preview ? '<button class="act preview-btn">Preview</button>' : ""}
         </div>
       </div>
@@ -720,7 +733,7 @@ function render() {
 }
 
 /* ---------- wire up + boot ---------- */
-$("addBtn").onclick = () => {
+$("addBtn").onclick = async () => {
   const url = $("linkInput").value.trim();
   if (!url) return;
   if (!/^https?:\/\/(www\.)?dropbox\.com\/(scl|sh)\//i.test(url)) {
@@ -729,11 +742,16 @@ $("addBtn").onclick = () => {
   }
   const links = getLinks();
   if (links.some((l) => l.url === url)) { setStatus("That link is already added."); return; }
-  links.push({ url, name: "" });
+  $("addBtn").disabled = true;
+  setStatus("Adding link…");
+  const token = await getAccessToken();
+  const name = token ? await getSharedLinkName(url, token) : ""; // default nickname = folder name
+  links.push({ url, name });
   LS.set("dbx_links", links);
   $("linkInput").value = "";
+  $("addBtn").disabled = false;
   renderSavedLinks();
-  setStatus('Link added. Click "Check for updates".');
+  setStatus(`Link added${name ? ` as "${name}"` : ""}. Click "Check for updates".`);
 };
 $("linkInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("addBtn").click(); });
 $("refreshBtn").onclick = refresh;

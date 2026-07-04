@@ -368,15 +368,92 @@ async function downloadFile(linkUrl, path, filename, token) {
   setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 }
 
-// Build a dropbox.com web URL for a subfolder. dl=0 opens it in Dropbox;
-// dl=1 downloads that subfolder as a zip. `subpath` deep-links into the folder.
-function folderUrl(sharedUrl, relPath, download) {
-  const u = new URL(sharedUrl);
-  u.searchParams.set("dl", download ? "1" : "0");
-  u.searchParams.delete("subpath");
-  let out = u.origin + u.pathname + "?" + u.searchParams.toString();
-  if (relPath) out += "&subpath=" + encodeURIComponent(relPath); // %2F, %20 — Dropbox style
+// ---- Client-side ZIP (STORE, no compression — 3D files are already compressed) ----
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+const u16 = (n) => new Uint8Array([n & 0xff, (n >> 8) & 0xff]);
+const u32 = (n) => new Uint8Array([n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >>> 24) & 0xff]);
+const cat = (arrs) => {
+  let len = 0; for (const a of arrs) len += a.length;
+  const out = new Uint8Array(len); let o = 0;
+  for (const a of arrs) { out.set(a, o); o += a.length; }
   return out;
+};
+function buildZip(files) {
+  const enc = new TextEncoder();
+  const chunks = [], central = [];
+  let offset = 0;
+  for (const f of files) {
+    const name = enc.encode(f.name), crc = crc32(f.data), size = f.data.length;
+    const lfh = cat([u32(0x04034b50), u16(20), u16(0), u16(0), u16(0), u16(0),
+      u32(crc), u32(size), u32(size), u16(name.length), u16(0), name]);
+    chunks.push(lfh, f.data);
+    central.push(cat([u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(0), u16(0),
+      u32(crc), u32(size), u32(size), u16(name.length), u16(0), u16(0), u16(0), u16(0),
+      u32(0), u32(offset), name]));
+    offset += lfh.length + size;
+  }
+  let centralSize = 0; for (const c of central) { chunks.push(c); centralSize += c.length; }
+  chunks.push(cat([u32(0x06054b50), u16(0), u16(0), u16(central.length), u16(central.length),
+    u32(centralSize), u32(offset), u16(0)]));
+  return new Blob(chunks, { type: "application/zip" });
+}
+
+async function fetchSharedFileBytes(url, path, token) {
+  const res = await dbxFetch("https://content.dropboxapi.com/2/sharing/get_shared_link_file", {
+    method: "POST",
+    headers: { Authorization: "Bearer " + token, "Dropbox-API-Arg": httpHeaderSafe(JSON.stringify({ url, path })) },
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return new Uint8Array(await (await res.blob()).arrayBuffer());
+}
+
+// Download an entire subfolder as a .zip, built in the browser.
+async function downloadFolderZip(url, folderPath, folderName, btn) {
+  const token = await getAccessToken();
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = "listing…";
+  const files = [];
+  async function walk(p, prefix) {
+    const entries = await listChildren(url, p, token);
+    for (const e of entries) {
+      if (e[".tag"] === "file") files.push({ path: p + "/" + e.name, rel: prefix + e.name });
+      else if (e[".tag"] === "folder") await walk(p + "/" + e.name, prefix + e.name + "/");
+    }
+  }
+  try {
+    await walk(folderPath, "");
+    if (!files.length) { alert("That folder has no files."); return; }
+    const zipFiles = [];
+    for (let i = 0; i < files.length; i++) {
+      btn.textContent = `${i + 1}/${files.length}`;
+      try { zipFiles.push({ name: files[i].rel, data: await fetchSharedFileBytes(url, files[i].path, token) }); }
+      catch (e) { console.warn("skip", files[i].rel, e); }
+    }
+    btn.textContent = "zipping…";
+    const blob = buildZip(zipFiles);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = folderName.replace(/[\\/:*?"<>|]/g, "_") + ".zip";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+  } catch (e) {
+    alert("Zip failed: " + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
 }
 
 // Fetch a preview image via the API and cache it as an object URL.
@@ -519,8 +596,7 @@ function renderResults() {
         </div>
         <div class="meta">${f.newest ? "newest: " + fmtDate(f.newest) : "no files"}</div>
         <div class="actions">
-          <a class="act" href="${folderUrl(f.link.url, f.path, false)}" target="_blank" rel="noopener">Open ↗</a>
-          ${f.isRoot ? "" : `<a class="act" href="${folderUrl(f.link.url, f.path, true)}">Zip ⬇</a>`}
+          ${f.isRoot ? "" : '<button class="act zip-btn">Zip ⬇</button>'}
           ${f.preview ? '<button class="act preview-btn">Preview</button>' : ""}
         </div>
       </div>
@@ -541,6 +617,8 @@ function renderResults() {
       pv.addEventListener("mouseleave", hidePreview);
       pv.addEventListener("click", (e) => e.preventDefault());
     }
+    const zip = card.querySelector(".zip-btn");
+    if (zip) zip.addEventListener("click", (e) => { e.stopPropagation(); downloadFolderZip(f.link.url, f.path, f.name, zip); });
     results.appendChild(card);
   }
 }

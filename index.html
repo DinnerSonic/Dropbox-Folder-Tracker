@@ -121,6 +121,21 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
   .progress-wrap { height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; margin: 8px 0; display: none; }
   .progress-bar { height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
+  .fh-main { flex: 1; min-width: 0; }
+  .actions { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+  .act {
+    font-size: 12px; font-weight: 500; padding: 5px 9px; border-radius: 6px;
+    border: 1px solid var(--border); background: transparent; color: var(--text);
+    cursor: pointer; text-decoration: none; white-space: nowrap; line-height: 1;
+  }
+  .act:hover { background: var(--panel-2); }
+  #previewPop {
+    position: fixed; display: none; z-index: 1000; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; padding: 5px;
+    box-shadow: 0 8px 28px rgba(0,0,0,0.5); pointer-events: none;
+  }
+  #previewPop img { display: block; max-width: 300px; max-height: 300px; border-radius: 4px; }
+  #previewPop .pv-msg { color: var(--muted); font-size: 12px; padding: 12px 16px; }
 </style>
 </head>
 <body>
@@ -166,6 +181,8 @@
   </div>
 </main>
 
+<div id="previewPop"><div class="pv-msg"></div><img alt="preview" /></div>
+
 <script>
 /* ============================================================================
    CONFIG — APP_KEY is your Dropbox app's "App key" (public, safe with PKCE).
@@ -181,6 +198,7 @@ const CONFIG = {
 const REDIRECT_URI = window.location.origin + window.location.pathname;
 const API = "https://api.dropboxapi.com/2/files/list_folder";
 const API_CONT = "https://api.dropboxapi.com/2/files/list_folder/continue";
+const PREVIEW_RE = /^PREVIEW_IMAGE\.(png|jpe?g|gif|webp)$/i;
 
 /* ---------- helpers ---------- */
 const $ = (id) => document.getElementById(id);
@@ -303,6 +321,8 @@ async function scanLink(url, token, onProgress) {
         for (const e of entries) {
           if (e[".tag"] === "file") {
             if (!record.newest || e.server_modified > record.newest) record.newest = e.server_modified;
+            // Flag a preview image (prefer the shallowest one found = top level, via BFS order)
+            if (!record.preview && PREVIEW_RE.test(e.name)) record.preview = relPath + "/" + e.name;
           } else if (e[".tag"] === "folder") {
             queue.push({ relPath: relPath + "/" + e.name, record });
             discovered++;
@@ -348,6 +368,50 @@ async function downloadFile(linkUrl, path, filename, token) {
   setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 }
 
+// Build a dropbox.com web URL for a subfolder. dl=0 opens it in Dropbox;
+// dl=1 downloads that subfolder as a zip. `subpath` deep-links into the folder.
+function folderUrl(sharedUrl, relPath, download) {
+  const u = new URL(sharedUrl);
+  u.searchParams.set("dl", download ? "1" : "0");
+  u.searchParams.delete("subpath");
+  let out = u.origin + u.pathname + "?" + u.searchParams.toString();
+  if (relPath) out += "&subpath=" + encodeURIComponent(relPath); // %2F, %20 — Dropbox style
+  return out;
+}
+
+// Fetch a preview image via the API and cache it as an object URL.
+const previewCache = {};
+async function getPreviewUrl(sharedUrl, path) {
+  const key = sharedUrl + "::" + path;
+  if (previewCache[key]) return previewCache[key];
+  const token = await getAccessToken();
+  const res = await dbxFetch("https://content.dropboxapi.com/2/sharing/get_shared_link_file", {
+    method: "POST",
+    headers: { Authorization: "Bearer " + token, "Dropbox-API-Arg": httpHeaderSafe(JSON.stringify({ url: sharedUrl, path })) },
+  });
+  if (!res.ok) throw new Error("preview " + res.status);
+  const obj = URL.createObjectURL(await res.blob());
+  previewCache[key] = obj;
+  return obj;
+}
+
+let previewToken = 0;
+async function showPreview(anchorEl, url, path) {
+  const p = $("previewPop"), img = p.querySelector("img"), msg = p.querySelector(".pv-msg");
+  const r = anchorEl.getBoundingClientRect();
+  p.style.display = "block";
+  p.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 320)) + "px";
+  p.style.top = (r.bottom + 320 > window.innerHeight ? Math.max(8, r.top - 320) : r.bottom + 8) + "px";
+  img.style.display = "none"; msg.style.display = "block"; msg.textContent = "Loading preview…";
+  const mine = ++previewToken;
+  try {
+    const src = await getPreviewUrl(url, path);
+    if (mine !== previewToken) return;
+    img.src = src; img.style.display = "block"; msg.style.display = "none";
+  } catch (e) { if (mine === previewToken) msg.textContent = "Preview unavailable"; }
+}
+function hidePreview() { previewToken++; $("previewPop").style.display = "none"; }
+
 /* ---------- state ---------- */
 const getLinks = () => LS.get("dbx_links", []);            // [{url, name}]
 const getSeen = () => LS.get("dbx_seen", {});              // { "url::folder": iso }
@@ -387,7 +451,7 @@ async function refresh() {
         setStatus(`Scanning "${label}" (${i + 1}/${links.length}) — ${done}/${total} folders`);
       });
       lastResults.push({ link, records });
-      cache[link.url] = { scannedAt: Date.now(), folders: Object.fromEntries(records.map((r) => [r.name, r.newest])) };
+      cache[link.url] = { scannedAt: Date.now(), folders: Object.fromEntries(records.map((r) => [r.name, { newest: r.newest, preview: r.preview || null }])) };
     } catch (e) {
       errors.push(`${label}: ${e.message}`);
     }
@@ -449,22 +513,34 @@ function renderResults() {
     card.innerHTML = `
       <div class="folder-head">
         <span class="caret">▶</span>
-        <div>
+        <div class="fh-main">
           <div><span class="folder-name">${esc(f.name)}</span> ${f.isNew ? '<span class="badge">NEW</span>' : ""}</div>
           ${lastResults.length > 1 ? `<div class="src">from ${esc(f.link.name || f.link.url)}</div>` : ""}
         </div>
         <div class="meta">${f.newest ? "newest: " + fmtDate(f.newest) : "no files"}</div>
+        <div class="actions">
+          <a class="act" href="${folderUrl(f.link.url, f.path, false)}" target="_blank" rel="noopener">Open ↗</a>
+          ${f.isRoot ? "" : `<a class="act" href="${folderUrl(f.link.url, f.path, true)}">Zip ⬇</a>`}
+          ${f.preview ? '<button class="act preview-btn">Preview</button>' : ""}
+        </div>
       </div>
       <div class="children"></div>`;
     const head = card.querySelector(".folder-head");
     const box = card.querySelector(".children");
     const caret = card.querySelector(".caret");
     let loaded = false;
-    head.onclick = async () => {
+    head.onclick = async (ev) => {
+      if (ev.target.closest(".actions")) return; // let action links/buttons do their thing
       const opening = !box.classList.contains("open");
       box.classList.toggle("open"); caret.classList.toggle("open");
       if (opening && !loaded) { loaded = true; await renderChildren(box, f.link.url, f.path, seen[seenKey(f.link.url, f.name)]); }
     };
+    const pv = card.querySelector(".preview-btn");
+    if (pv) {
+      pv.addEventListener("mouseenter", () => showPreview(pv, f.link.url, f.preview));
+      pv.addEventListener("mouseleave", hidePreview);
+      pv.addEventListener("click", (e) => e.preventDefault());
+    }
     results.appendChild(card);
   }
 }
@@ -536,9 +612,13 @@ function loadFromCache() {
   for (const link of links) {
     const c = cache[link.url];
     if (!c) continue;
-    const records = Object.entries(c.folders).map(([name, newest]) => ({
-      name, newest, path: name === "(files in root)" ? "" : "/" + name, isRoot: name === "(files in root)",
-    }));
+    const records = Object.entries(c.folders).map(([name, v]) => {
+      const val = typeof v === "string" ? { newest: v } : (v || {});
+      return {
+        name, newest: val.newest || null, preview: val.preview || null,
+        path: name === "(files in root)" ? "" : "/" + name, isRoot: name === "(files in root)",
+      };
+    });
     lastResults.push({ link, records });
   }
 }

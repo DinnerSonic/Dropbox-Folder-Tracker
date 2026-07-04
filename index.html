@@ -78,7 +78,7 @@
     cursor: pointer;
   }
   .folder-head:hover { background: rgba(255,255,255,0.02); }
-  .folder-name { font-weight: 600; }
+  .folder-name { font-weight: 600; word-break: break-word; }
   .badge {
     font-size: 11px;
     font-weight: 700;
@@ -87,22 +87,23 @@
     background: var(--new);
     color: #1a1200;
     letter-spacing: 0.4px;
+    white-space: nowrap;
   }
-  .meta { color: var(--muted); font-size: 13px; margin-left: auto; text-align: right; }
+  .meta { color: var(--muted); font-size: 13px; margin-left: auto; text-align: right; white-space: nowrap; }
   .src { color: var(--muted); font-size: 12px; }
-  .files { border-top: 1px solid var(--border); padding: 4px 0; display: none; }
-  .files.open { display: block; }
-  .file {
+  .children { border-top: 1px solid var(--border); padding: 4px 0; display: none; }
+  .children.open { display: block; }
+  .child {
     display: flex;
     align-items: center;
-    gap: 12px;
-    padding: 8px 16px 8px 40px;
+    gap: 10px;
+    padding: 7px 16px;
     font-size: 13px;
   }
-  .file:hover { background: rgba(255,255,255,0.02); }
-  .file .fname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .file.is-new .fname { color: var(--new); font-weight: 600; }
-  .file .fdate { color: var(--muted); white-space: nowrap; }
+  .child:hover { background: rgba(255,255,255,0.02); }
+  .child .cname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .child.is-new .cname { color: var(--new); font-weight: 600; }
+  .child .cdate { color: var(--muted); white-space: nowrap; }
   .saved-links { margin-bottom: 20px; }
   .saved-link {
     display: flex; align-items: center; gap: 10px;
@@ -110,14 +111,16 @@
     border-radius: 7px; margin-bottom: 6px; font-size: 13px;
   }
   .saved-link .url { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
-  .status { color: var(--muted); font-size: 13px; margin: 8px 0; min-height: 18px; }
+  .status { color: var(--muted); font-size: 13px; margin: 8px 0; min-height: 18px; white-space: pre-wrap; }
   .error { color: #f0716f; }
-  .caret { transition: transform 0.15s; color: var(--muted); }
+  .caret { transition: transform 0.15s; color: var(--muted); width: 12px; display: inline-block; }
   .caret.open { transform: rotate(90deg); }
   a { color: var(--accent-hover); }
   .hint { color: var(--muted); font-size: 13px; }
   .connected { color: var(--ok); font-size: 13px; display: flex; align-items: center; gap: 6px; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+  .progress-wrap { height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; margin: 8px 0; display: none; }
+  .progress-bar { height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
 </style>
 </head>
 <body>
@@ -129,11 +132,11 @@
 </header>
 
 <main>
-  <div id="setupNotice" style="display:none" class="card" >
+  <div id="setupNotice" style="display:none" class="card">
     <div style="padding:16px">
       <strong>⚙️ One-time setup needed.</strong>
       <p class="hint">The app key hasn't been filled in yet. Open <code>index.html</code> and set
-      <code>CONFIG.APP_KEY</code> to your Dropbox app key. See the README for the 2-minute setup.</p>
+      <code>CONFIG.APP_KEY</code>. See the README.</p>
     </div>
   </div>
 
@@ -152,6 +155,7 @@
       <span class="hint" id="lastCheck"></span>
     </div>
 
+    <div class="progress-wrap" id="progressWrap"><div class="progress-bar" id="progressBar"></div></div>
     <div id="status" class="status"></div>
     <div id="results"></div>
   </div>
@@ -164,35 +168,37 @@
 
 <script>
 /* ============================================================================
-   CONFIG — edit these two lines, then host the file (e.g. GitHub Pages).
-   APP_KEY is your Dropbox app's "App key" (public, safe to embed with PKCE).
-   REDIRECT_URI is computed automatically as this page's URL — register that
-   exact URL in your Dropbox app's OAuth "Redirect URIs" list.
+   CONFIG — APP_KEY is your Dropbox app's "App key" (public, safe with PKCE).
    ========================================================================== */
 const CONFIG = {
   APP_KEY: "uzwm5jp3hh22zz8",
   SCOPES: "account_info.read files.metadata.read sharing.read files.content.read",
-  // Max shared links fetched in parallel (keep small to stay well under rate limits)
-  CONCURRENCY: 3,
+  // How many folder-listing requests to run at once during a scan.
+  // Dropbox has NO working "recursive" mode for shared links, so every
+  // subfolder must be listed individually — keep this modest to avoid 429s.
+  SCAN_CONCURRENCY: 8,
 };
 const REDIRECT_URI = window.location.origin + window.location.pathname;
+const API = "https://api.dropboxapi.com/2/files/list_folder";
+const API_CONT = "https://api.dropboxapi.com/2/files/list_folder/continue";
 
-/* ---------- tiny helpers ---------- */
+/* ---------- helpers ---------- */
 const $ = (id) => document.getElementById(id);
 const LS = {
   get: (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
-  set: (k, v) => localStorage.setItem(k, JSON.stringify(v)),
+  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { console.warn("localStorage full", e); } },
   del: (k) => localStorage.removeItem(k),
 };
 const fmtDate = (iso) => {
   if (!iso) return "—";
   const d = new Date(iso);
   const days = Math.floor((Date.now() - d) / 86400000);
-  const rel = days === 0 ? "today" : days === 1 ? "yesterday" : `${days}d ago`;
-  return `${d.toLocaleDateString()} (${rel})`;
+  const rel = days < 0 ? "" : days === 0 ? "today" : days === 1 ? "yesterday" : `${days}d ago`;
+  return `${d.toLocaleDateString()}${rel ? " (" + rel + ")" : ""}`;
 };
+const esc = (s) => (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-/* ---------- PKCE ---------- */
+/* ---------- PKCE auth ---------- */
 function randomString(len) {
   const a = new Uint8Array(len);
   crypto.getRandomValues(a);
@@ -202,75 +208,51 @@ function base64url(buf) {
   return btoa(String.fromCharCode(...new Uint8Array(buf)))
     .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
-async function pkceChallenge(verifier) {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
-  return base64url(digest);
+async function pkceChallenge(v) {
+  return base64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(v)));
 }
-
 async function startAuth() {
   const verifier = randomString(48);
   sessionStorage.setItem("pkce_verifier", verifier);
-  const challenge = await pkceChallenge(verifier);
   const params = new URLSearchParams({
-    client_id: CONFIG.APP_KEY,
-    response_type: "code",
-    code_challenge: challenge,
-    code_challenge_method: "S256",
-    redirect_uri: REDIRECT_URI,
-    token_access_type: "offline",
-    scope: CONFIG.SCOPES,
+    client_id: CONFIG.APP_KEY, response_type: "code",
+    code_challenge: await pkceChallenge(verifier), code_challenge_method: "S256",
+    redirect_uri: REDIRECT_URI, token_access_type: "offline", scope: CONFIG.SCOPES,
   });
   window.location = "https://www.dropbox.com/oauth2/authorize?" + params;
 }
-
 async function exchangeCode(code) {
-  const verifier = sessionStorage.getItem("pkce_verifier");
   const body = new URLSearchParams({
-    code,
-    grant_type: "authorization_code",
-    redirect_uri: REDIRECT_URI,
-    client_id: CONFIG.APP_KEY,
-    code_verifier: verifier,
+    code, grant_type: "authorization_code", redirect_uri: REDIRECT_URI,
+    client_id: CONFIG.APP_KEY, code_verifier: sessionStorage.getItem("pkce_verifier"),
   });
   const res = await fetch("https://api.dropboxapi.com/oauth2/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
-  });
+    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
   if (!res.ok) throw new Error("Token exchange failed: " + (await res.text()));
   const tok = await res.json();
   LS.set("dbx_refresh", tok.refresh_token);
   LS.set("dbx_access", { token: tok.access_token, exp: Date.now() + (tok.expires_in - 60) * 1000 });
 }
-
 async function getAccessToken() {
   const cached = LS.get("dbx_access", null);
   if (cached && cached.exp > Date.now()) return cached.token;
   const refresh = LS.get("dbx_refresh", null);
   if (!refresh) return null;
-  const body = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: refresh,
-    client_id: CONFIG.APP_KEY,
-  });
+  const body = new URLSearchParams({ grant_type: "refresh_token", refresh_token: refresh, client_id: CONFIG.APP_KEY });
   const res = await fetch("https://api.dropboxapi.com/oauth2/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
-  });
+    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
   if (!res.ok) { LS.del("dbx_refresh"); return null; }
   const tok = await res.json();
   LS.set("dbx_access", { token: tok.access_token, exp: Date.now() + (tok.expires_in - 60) * 1000 });
   return tok.access_token;
 }
+const isConnected = () => !!LS.get("dbx_refresh", null);
+function disconnect() { LS.del("dbx_refresh"); LS.del("dbx_access"); lastResults = []; render(); }
 
-function isConnected() { return !!LS.get("dbx_refresh", null); }
-function disconnect() { LS.del("dbx_refresh"); LS.del("dbx_access"); render(); }
-
-/* ---------- Dropbox API with rate-limit backoff ---------- */
+/* ---------- Dropbox API with 429 backoff ---------- */
 async function dbxFetch(url, options, attempt = 0) {
   const res = await fetch(url, options);
-  if (res.status === 429 && attempt < 5) {
+  if (res.status === 429 && attempt < 6) {
     const retry = parseInt(res.headers.get("Retry-After") || "2", 10);
     setStatus(`Rate limited by Dropbox — waiting ${retry}s…`);
     await new Promise((r) => setTimeout(r, retry * 1000));
@@ -279,30 +261,75 @@ async function dbxFetch(url, options, attempt = 0) {
   return res;
 }
 
-async function listSharedLink(url, token) {
-  // Walk an entire shared folder tree recursively (few paginated calls total).
+// List ONE folder's immediate children (non-recursive; recursive is broken for
+// shared links). `path` is "" for the shared root, or "/Sub/Folder" relative to it.
+async function listChildren(url, path, token) {
   const entries = [];
-  let body = { path: "", shared_link: { url }, recursive: true, include_deleted: false };
-  let endpoint = "https://api.dropboxapi.com/2/files/list_folder";
+  let endpoint = API;
+  let body = { path, shared_link: { url }, recursive: false, include_deleted: false };
   while (true) {
     const res = await dbxFetch(endpoint, {
       method: "POST",
       headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+    if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).slice(0, 200)}`);
     const data = await res.json();
     entries.push(...data.entries);
     if (!data.has_more) break;
-    endpoint = "https://api.dropboxapi.com/2/files/list_folder/continue";
+    endpoint = API_CONT;
     body = { cursor: data.cursor };
   }
   return entries;
 }
 
+// Walk a shared link folder-by-folder, computing the newest file date inside
+// each TOP-LEVEL subfolder (searching all the way down). Returns folder records.
+async function scanLink(url, token, onProgress) {
+  const root = await listChildren(url, "", token);
+  const records = [];
+  const rootFiles = [];
+  for (const e of root) {
+    if (e[".tag"] === "folder") records.push({ name: e.name, path: "/" + e.name, newest: null });
+    else if (e[".tag"] === "file") rootFiles.push(e);
+  }
+  const queue = records.map((r) => ({ relPath: r.path, record: r }));
+  let processed = 0, discovered = queue.length;
+  async function worker() {
+    while (queue.length) {
+      const { relPath, record } = queue.shift();
+      try {
+        const entries = await listChildren(url, relPath, token);
+        for (const e of entries) {
+          if (e[".tag"] === "file") {
+            if (!record.newest || e.server_modified > record.newest) record.newest = e.server_modified;
+          } else if (e[".tag"] === "folder") {
+            queue.push({ relPath: relPath + "/" + e.name, record });
+            discovered++;
+          }
+        }
+      } catch (e) { /* skip unreadable folder, keep going */ }
+      processed++;
+      if (onProgress) onProgress(processed, discovered);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(CONFIG.SCAN_CONCURRENCY, queue.length || 1) }, worker));
+  if (rootFiles.length) {
+    let newest = null;
+    for (const f of rootFiles) if (!newest || f.server_modified > newest) newest = f.server_modified;
+    records.push({ name: "(files in root)", path: "", newest, isRoot: true });
+  }
+  return records;
+}
+
 // Escape non-ASCII for the Dropbox-API-Arg header (required by Dropbox).
 function httpHeaderSafe(s) {
-  return s.replace(/[-￿]/g, (c) => "\\u" + ("0000" + c.charCodeAt(0).toString(16)).slice(-4));
+  let out = "";
+  for (const ch of s) {
+    const c = ch.charCodeAt(0);
+    out += c > 0x7f ? "\\u" + ("0000" + c.toString(16)).slice(-4) : ch;
+  }
+  return out;
 }
 async function downloadFile(linkUrl, path, filename, token) {
   const res = await dbxFetch("https://content.dropboxapi.com/2/sharing/get_shared_link_file", {
@@ -321,48 +348,24 @@ async function downloadFile(linkUrl, path, filename, token) {
   setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 }
 
-/* ---------- grouping: build per-subfolder summary from recursive entries ---------- */
-function summarize(entries) {
-  // Group files by their top-level subfolder (relative to the shared root).
-  const folders = new Map(); // key -> {name, newest, files:[]}
-  const ensure = (name) => {
-    if (!folders.has(name)) folders.set(name, { name, newest: null, files: [] });
-    return folders.get(name);
-  };
-  for (const e of entries) {
-    if (e[".tag"] !== "file") continue;
-    const rel = (e.path_display || "").replace(/^\/+/, ""); // "Sub/dir/file.stl"
-    const parts = rel.split("/");
-    const top = parts.length > 1 ? parts[0] : "(files in root)";
-    const f = ensure(top);
-    const modified = e.server_modified;
-    f.files.push({ name: parts[parts.length - 1], path: e.path_display, modified, size: e.size });
-    if (!f.newest || modified > f.newest) f.newest = modified;
-  }
-  // also surface empty subfolders (folder entries directly under root)
-  for (const e of entries) {
-    if (e[".tag"] !== "folder") continue;
-    const rel = (e.path_display || "").replace(/^\/+/, "");
-    if (rel && !rel.includes("/") && !folders.has(rel)) ensure(rel);
-  }
-  for (const f of folders.values()) f.files.sort((a, b) => (b.modified || "").localeCompare(a.modified || ""));
-  return [...folders.values()];
-}
-
 /* ---------- state ---------- */
-const getLinks = () => LS.get("dbx_links", []);          // [{url, name}]
-const getSeen = () => LS.get("dbx_seen", {});            // { "url::folder": iso }
+const getLinks = () => LS.get("dbx_links", []);            // [{url, name}]
+const getSeen = () => LS.get("dbx_seen", {});              // { "url::folder": iso }
+const getCache = () => LS.get("dbx_cache", {});            // { url: { scannedAt, folders:{name:newest} } }
 const seenKey = (url, folder) => `${url}::${folder}`;
+let lastResults = [];   // [{ link, records:[{name,path,newest}] }]
 
 function setStatus(msg, isError = false) {
-  const el = $("status");
-  el.textContent = msg;
-  el.className = "status" + (isError ? " error" : "");
+  const el = $("status"); el.textContent = msg || ""; el.className = "status" + (isError ? " error" : "");
+}
+function setProgress(done, total) {
+  const w = $("progressWrap"), b = $("progressBar");
+  if (total == null) { w.style.display = "none"; return; }
+  w.style.display = "block";
+  b.style.width = (total ? Math.round((done / total) * 100) : 0) + "%";
 }
 
-/* ---------- main refresh ---------- */
-let lastResults = []; // [{link, folders:[...]}]
-
+/* ---------- refresh (scan all links) ---------- */
 async function refresh() {
   const token = await getAccessToken();
   if (!token) { render(); return; }
@@ -370,26 +373,29 @@ async function refresh() {
   if (!links.length) { setStatus("Add a shared link above to begin."); $("results").innerHTML = ""; return; }
 
   $("refreshBtn").disabled = true;
-  setStatus("Checking Dropbox…");
   lastResults = [];
-
-  // simple concurrency pool
-  const queue = [...links];
+  const cache = getCache();
   const errors = [];
-  async function worker() {
-    while (queue.length) {
-      const link = queue.shift();
-      try {
-        const entries = await listSharedLink(link.url, token);
-        lastResults.push({ link, folders: summarize(entries) });
-      } catch (e) {
-        errors.push(`${link.name || link.url}: ${e.message}`);
-      }
+
+  for (let i = 0; i < links.length; i++) {
+    const link = links[i];
+    const label = link.name || link.url;
+    setStatus(`Scanning "${label}" (${i + 1}/${links.length})… folders can be many, this may take a minute.`);
+    try {
+      const records = await scanLink(link.url, token, (done, total) => {
+        setProgress(done, total);
+        setStatus(`Scanning "${label}" (${i + 1}/${links.length}) — ${done}/${total} folders`);
+      });
+      lastResults.push({ link, records });
+      cache[link.url] = { scannedAt: Date.now(), folders: Object.fromEntries(records.map((r) => [r.name, r.newest])) };
+    } catch (e) {
+      errors.push(`${label}: ${e.message}`);
     }
   }
-  await Promise.all(Array.from({ length: Math.min(CONFIG.CONCURRENCY, links.length) }, worker));
 
+  LS.set("dbx_cache", cache);
   LS.set("dbx_lastCheck", Date.now());
+  setProgress(null);
   $("refreshBtn").disabled = false;
   setStatus(errors.length ? "Some links failed:\n" + errors.join("\n") : "", errors.length > 0);
   renderResults();
@@ -403,16 +409,14 @@ function updateLastCheck() {
 }
 
 function renderSavedLinks() {
-  const wrap = $("savedLinks");
-  const links = getLinks();
+  const wrap = $("savedLinks"), links = getLinks();
   wrap.innerHTML = links.length ? "" : '<span class="hint">No links added yet.</span>';
   links.forEach((link, i) => {
     const row = document.createElement("div");
     row.className = "saved-link";
-    row.innerHTML = `<span>🔗</span><input class="linkname" data-i="${i}" type="text" value="${
-      (link.name || "").replace(/"/g, "&quot;")}" placeholder="Nickname (optional)"
-      style="flex:0 0 200px;background:transparent;border:none;color:var(--text)"/>
-      <span class="url">${link.url}</span>
+    row.innerHTML = `<span>🔗</span><input class="linkname" data-i="${i}" type="text" value="${esc(link.name)}"
+      placeholder="Nickname (optional)" style="flex:0 0 200px;background:transparent;border:none;color:var(--text)"/>
+      <span class="url">${esc(link.url)}</span>
       <button class="ghost small" data-del="${i}">Remove</button>`;
     wrap.appendChild(row);
   });
@@ -423,75 +427,120 @@ function renderSavedLinks() {
 }
 
 function renderResults() {
-  const seen = getSeen();
-  const results = $("results");
+  const seen = getSeen(), results = $("results");
   results.innerHTML = "";
-
-  // flatten to one list of folders across all links, newest first
   const all = [];
-  for (const r of lastResults) {
-    for (const f of r.folders) {
+  for (const r of lastResults)
+    for (const f of r.records) {
       const last = seen[seenKey(r.link.url, f.name)] || null;
       const isNew = f.newest && (!last || f.newest > last);
-      all.push({ ...f, link: r.link, isNew, last });
+      all.push({ ...f, link: r.link, isNew });
     }
-  }
   all.sort((a, b) => (b.newest || "").localeCompare(a.newest || ""));
 
-  if (!all.length) { setStatus("No folders found in these links."); return; }
+  if (!all.length) { setStatus('No folders found. Click "Check for updates" to scan.'); return; }
+
+  const newCount = all.filter((f) => f.isNew).length;
+  if (newCount) setStatus(`${newCount} folder${newCount === 1 ? "" : "s"} updated since you last marked as seen.`);
 
   for (const f of all) {
     const card = document.createElement("div");
     card.className = "card" + (f.isNew ? " is-new" : "");
-    const filesHtml = f.files.map((file) => {
-      const fileNew = f.last ? file.modified > f.last : f.isNew;
-      return `<div class="file ${fileNew ? "is-new" : ""}">
-        <span class="fname">${fileNew ? "● " : ""}${file.name}</span>
-        <span class="fdate">${fmtDate(file.modified)}</span>
-        <button class="ghost small" data-dl='${encodeURIComponent(JSON.stringify(
-          { url: f.link.url, path: file.path, name: file.name }))}'>Download</button>
-      </div>`;
-    }).join("");
-
     card.innerHTML = `
       <div class="folder-head">
         <span class="caret">▶</span>
         <div>
-          <div><span class="folder-name">${f.name}</span> ${f.isNew ? '<span class="badge">NEW</span>' : ""}</div>
-          <div class="src">from ${f.link.name || f.link.url}</div>
+          <div><span class="folder-name">${esc(f.name)}</span> ${f.isNew ? '<span class="badge">NEW</span>' : ""}</div>
+          ${lastResults.length > 1 ? `<div class="src">from ${esc(f.link.name || f.link.url)}</div>` : ""}
         </div>
-        <div class="meta">${f.files.length} file${f.files.length === 1 ? "" : "s"}<br>
-          <span>${f.newest ? "newest: " + fmtDate(f.newest) : "empty"}</span></div>
+        <div class="meta">${f.newest ? "newest: " + fmtDate(f.newest) : "no files"}</div>
       </div>
-      <div class="files">${filesHtml}</div>`;
-
+      <div class="children"></div>`;
     const head = card.querySelector(".folder-head");
-    const files = card.querySelector(".files");
+    const box = card.querySelector(".children");
     const caret = card.querySelector(".caret");
-    head.onclick = (ev) => {
-      if (ev.target.tagName === "BUTTON") return;
-      files.classList.toggle("open"); caret.classList.toggle("open");
+    let loaded = false;
+    head.onclick = async () => {
+      const opening = !box.classList.contains("open");
+      box.classList.toggle("open"); caret.classList.toggle("open");
+      if (opening && !loaded) { loaded = true; await renderChildren(box, f.link.url, f.path, seen[seenKey(f.link.url, f.name)]); }
     };
-    card.querySelectorAll("[data-dl]").forEach((b) =>
-      b.onclick = async () => {
-        const d = JSON.parse(decodeURIComponent(b.dataset.dl));
-        b.disabled = true; b.textContent = "…";
-        const token = await getAccessToken();
-        await downloadFile(d.url, d.path, d.name, token);
-        b.disabled = false; b.textContent = "Download";
-      });
     results.appendChild(card);
   }
+}
+
+// Lazily list one folder's immediate children into `container` (files download,
+// subfolders expand deeper).
+async function renderChildren(container, url, path, seenIso, depth = 0) {
+  container.innerHTML = `<div class="child" style="padding-left:${16 + depth * 18}px">loading…</div>`;
+  const token = await getAccessToken();
+  let entries;
+  try { entries = await listChildren(url, path, token); }
+  catch (e) { container.innerHTML = `<div class="child error">Failed: ${esc(e.message)}</div>`; return; }
+
+  const folders = entries.filter((e) => e[".tag"] === "folder").sort((a, b) => a.name.localeCompare(b.name));
+  const files = entries.filter((e) => e[".tag"] === "file").sort((a, b) => (b.server_modified || "").localeCompare(a.server_modified || ""));
+  container.innerHTML = "";
+  const pad = 16 + depth * 18;
+
+  for (const fo of folders) {
+    const childPath = path + "/" + fo.name;
+    const row = document.createElement("div");
+    row.className = "child";
+    row.style.paddingLeft = pad + "px";
+    row.innerHTML = `<span class="caret">▶</span><span class="cname">📁 ${esc(fo.name)}</span>`;
+    const sub = document.createElement("div");
+    sub.className = "children";
+    let done = false;
+    row.onclick = async () => {
+      const opening = !sub.classList.contains("open");
+      sub.classList.toggle("open"); row.querySelector(".caret").classList.toggle("open");
+      if (opening && !done) { done = true; await renderChildren(sub, url, childPath, seenIso, depth + 1); }
+    };
+    container.appendChild(row);
+    container.appendChild(sub);
+  }
+  for (const fi of files) {
+    const isNew = seenIso ? fi.server_modified > seenIso : false;
+    const filePath = path + "/" + fi.name;
+    const row = document.createElement("div");
+    row.className = "child" + (isNew ? " is-new" : "");
+    row.style.paddingLeft = pad + 18 + "px";
+    row.innerHTML = `<span class="cname">${isNew ? "● " : ""}${esc(fi.name)}</span>
+      <span class="cdate">${fmtDate(fi.server_modified)}</span>
+      <button class="ghost small dl">Download</button>`;
+    row.querySelector(".dl").onclick = async (ev) => {
+      ev.stopPropagation();
+      const btn = ev.target; btn.disabled = true; btn.textContent = "…";
+      await downloadFile(url, filePath, fi.name, await getAccessToken());
+      btn.disabled = false; btn.textContent = "Download";
+    };
+    container.appendChild(row);
+  }
+  if (!entries.length) container.innerHTML = `<div class="child" style="padding-left:${pad}px">(empty)</div>`;
 }
 
 function markAllSeen() {
   const seen = getSeen();
   for (const r of lastResults)
-    for (const f of r.folders)
-      if (f.newest) seen[seenKey(r.link.url, f.name)] = f.newest;
+    for (const f of r.records) if (f.newest) seen[seenKey(r.link.url, f.name)] = f.newest;
   LS.set("dbx_seen", seen);
   renderResults();
   setStatus("Marked everything as seen. Future changes will be highlighted.");
+}
+
+// Build lastResults from cache (for instant display on load, before a rescan).
+function loadFromCache() {
+  const cache = getCache(), links = getLinks();
+  lastResults = [];
+  for (const link of links) {
+    const c = cache[link.url];
+    if (!c) continue;
+    const records = Object.entries(c.folders).map(([name, newest]) => ({
+      name, newest, path: name === "(files in root)" ? "" : "/" + name, isRoot: name === "(files in root)",
+    }));
+    lastResults.push({ link, records });
+  }
 }
 
 /* ---------- top-level render ---------- */
@@ -503,10 +552,8 @@ function render() {
   $("connectBtn").textContent = connected ? "Disconnect" : "Connect Dropbox";
   $("connectBtn").onclick = connected ? disconnect : startAuth;
   $("connectBtn").disabled = !configured;
-
   $("app").style.display = connected && configured ? "block" : "none";
   $("signedOut").style.display = !connected && configured ? "block" : "none";
-
   if (connected && configured) {
     renderSavedLinks();
     updateLastCheck();
@@ -518,7 +565,10 @@ function render() {
 $("addBtn").onclick = () => {
   const url = $("linkInput").value.trim();
   if (!url) return;
-  if (!/^https?:\/\/(www\.)?dropbox\.com\//i.test(url)) { setStatus("That doesn't look like a Dropbox link.", true); return; }
+  if (!/^https?:\/\/(www\.)?dropbox\.com\/(scl|sh)\//i.test(url)) {
+    setStatus("That doesn't look like a Dropbox shared link. Use Dropbox → Copy link (a /scl/ or /sh/ URL). A /home/ URL won't work.", true);
+    return;
+  }
   const links = getLinks();
   if (links.some((l) => l.url === url)) { setStatus("That link is already added."); return; }
   links.push({ url, name: "" });
@@ -534,17 +584,17 @@ $("markSeenBtn").onclick = markAllSeen;
 (async function boot() {
   const params = new URLSearchParams(window.location.search);
   if (params.get("code")) {
-    try {
-      setStatus("Finishing sign-in…");
-      await exchangeCode(params.get("code"));
-    } catch (e) {
-      setStatus(e.message, true);
-    }
-    // clean the ?code= out of the URL
+    try { setStatus("Finishing sign-in…"); await exchangeCode(params.get("code")); }
+    catch (e) { setStatus(e.message, true); }
     window.history.replaceState({}, "", REDIRECT_URI);
   }
+  loadFromCache();
   render();
-  if (isConnected()) refresh();
+  // Don't auto-scan (can be slow for big libraries) — show cached results and
+  // let the user click "Check for updates".
+  if (isConnected() && !lastResults.length && getLinks().length) {
+    setStatus('Click "Check for updates" to scan your folders.');
+  }
 })();
 </script>
 </body>

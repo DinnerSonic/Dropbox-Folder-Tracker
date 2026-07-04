@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Dropbox Folder Tracker</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a2029;
+    --panel-2: #222b36;
+    --border: #2e3947;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --accent: #2f7cf6;
+    --accent-hover: #4a90ff;
+    --new: #f5a623;
+    --new-bg: rgba(245, 166, 35, 0.12);
+    --ok: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  .spacer { flex: 1; }
+  main { max-width: 960px; margin: 0 auto; padding: 24px; }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 9px 16px;
+    border-radius: 7px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  button:hover { background: var(--accent-hover); }
+  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  button.ghost:hover { background: var(--panel-2); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.small { padding: 5px 10px; font-size: 13px; }
+  input[type=text] {
+    flex: 1;
+    min-width: 240px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px 12px;
+    border-radius: 7px;
+    font-size: 14px;
+  }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 10px;
+    overflow: hidden;
+  }
+  .card.is-new { border-color: var(--new); background: var(--new-bg); }
+  .folder-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 16px;
+    cursor: pointer;
+  }
+  .folder-head:hover { background: rgba(255,255,255,0.02); }
+  .folder-name { font-weight: 600; }
+  .badge {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 5px;
+    background: var(--new);
+    color: #1a1200;
+    letter-spacing: 0.4px;
+  }
+  .meta { color: var(--muted); font-size: 13px; margin-left: auto; text-align: right; }
+  .src { color: var(--muted); font-size: 12px; }
+  .files { border-top: 1px solid var(--border); padding: 4px 0; display: none; }
+  .files.open { display: block; }
+  .file {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 16px 8px 40px;
+    font-size: 13px;
+  }
+  .file:hover { background: rgba(255,255,255,0.02); }
+  .file .fname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file.is-new .fname { color: var(--new); font-weight: 600; }
+  .file .fdate { color: var(--muted); white-space: nowrap; }
+  .saved-links { margin-bottom: 20px; }
+  .saved-link {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 7px; margin-bottom: 6px; font-size: 13px;
+  }
+  .saved-link .url { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+  .status { color: var(--muted); font-size: 13px; margin: 8px 0; min-height: 18px; }
+  .error { color: #f0716f; }
+  .caret { transition: transform 0.15s; color: var(--muted); }
+  .caret.open { transform: rotate(90deg); }
+  a { color: var(--accent-hover); }
+  .hint { color: var(--muted); font-size: 13px; }
+  .connected { color: var(--ok); font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+</style>
+</head>
+<body>
+<header>
+  <h1>📦 Dropbox Folder Tracker</h1>
+  <div class="spacer"></div>
+  <span id="authStatus"></span>
+  <button id="connectBtn" class="ghost">Connect Dropbox</button>
+</header>
+
+<main>
+  <div id="setupNotice" style="display:none" class="card" >
+    <div style="padding:16px">
+      <strong>⚙️ One-time setup needed.</strong>
+      <p class="hint">The app key hasn't been filled in yet. Open <code>index.html</code> and set
+      <code>CONFIG.APP_KEY</code> to your Dropbox app key. See the README for the 2-minute setup.</p>
+    </div>
+  </div>
+
+  <div id="app" style="display:none">
+    <div class="row">
+      <input id="linkInput" type="text" placeholder="Paste a Dropbox shared folder link…" />
+      <button id="addBtn">Add link</button>
+    </div>
+
+    <div id="savedLinks" class="saved-links"></div>
+
+    <div class="row">
+      <button id="refreshBtn">🔄 Check for updates</button>
+      <button id="markSeenBtn" class="ghost">Mark all as seen</button>
+      <div class="spacer"></div>
+      <span class="hint" id="lastCheck"></span>
+    </div>
+
+    <div id="status" class="status"></div>
+    <div id="results"></div>
+  </div>
+
+  <div id="signedOut" style="display:none">
+    <p class="hint">Connect your Dropbox account to get started. You only do this once —
+    the app then remembers you on this computer.</p>
+  </div>
+</main>
+
+<script>
+/* ============================================================================
+   CONFIG — edit these two lines, then host the file (e.g. GitHub Pages).
+   APP_KEY is your Dropbox app's "App key" (public, safe to embed with PKCE).
+   REDIRECT_URI is computed automatically as this page's URL — register that
+   exact URL in your Dropbox app's OAuth "Redirect URIs" list.
+   ========================================================================== */
+const CONFIG = {
+  APP_KEY: "PASTE_YOUR_DROPBOX_APP_KEY",
+  SCOPES: "account_info.read files.metadata.read sharing.read files.content.read",
+  // Max shared links fetched in parallel (keep small to stay well under rate limits)
+  CONCURRENCY: 3,
+};
+const REDIRECT_URI = window.location.origin + window.location.pathname;
+
+/* ---------- tiny helpers ---------- */
+const $ = (id) => document.getElementById(id);
+const LS = {
+  get: (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
+  set: (k, v) => localStorage.setItem(k, JSON.stringify(v)),
+  del: (k) => localStorage.removeItem(k),
+};
+const fmtDate = (iso) => {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  const days = Math.floor((Date.now() - d) / 86400000);
+  const rel = days === 0 ? "today" : days === 1 ? "yesterday" : `${days}d ago`;
+  return `${d.toLocaleDateString()} (${rel})`;
+};
+
+/* ---------- PKCE ---------- */
+function randomString(len) {
+  const a = new Uint8Array(len);
+  crypto.getRandomValues(a);
+  return Array.from(a, (b) => ("0" + b.toString(16)).slice(-2)).join("");
+}
+function base64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+async function pkceChallenge(verifier) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return base64url(digest);
+}
+
+async function startAuth() {
+  const verifier = randomString(48);
+  sessionStorage.setItem("pkce_verifier", verifier);
+  const challenge = await pkceChallenge(verifier);
+  const params = new URLSearchParams({
+    client_id: CONFIG.APP_KEY,
+    response_type: "code",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    redirect_uri: REDIRECT_URI,
+    token_access_type: "offline",
+    scope: CONFIG.SCOPES,
+  });
+  window.location = "https://www.dropbox.com/oauth2/authorize?" + params;
+}
+
+async function exchangeCode(code) {
+  const verifier = sessionStorage.getItem("pkce_verifier");
+  const body = new URLSearchParams({
+    code,
+    grant_type: "authorization_code",
+    redirect_uri: REDIRECT_URI,
+    client_id: CONFIG.APP_KEY,
+    code_verifier: verifier,
+  });
+  const res = await fetch("https://api.dropboxapi.com/oauth2/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  if (!res.ok) throw new Error("Token exchange failed: " + (await res.text()));
+  const tok = await res.json();
+  LS.set("dbx_refresh", tok.refresh_token);
+  LS.set("dbx_access", { token: tok.access_token, exp: Date.now() + (tok.expires_in - 60) * 1000 });
+}
+
+async function getAccessToken() {
+  const cached = LS.get("dbx_access", null);
+  if (cached && cached.exp > Date.now()) return cached.token;
+  const refresh = LS.get("dbx_refresh", null);
+  if (!refresh) return null;
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: refresh,
+    client_id: CONFIG.APP_KEY,
+  });
+  const res = await fetch("https://api.dropboxapi.com/oauth2/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  if (!res.ok) { LS.del("dbx_refresh"); return null; }
+  const tok = await res.json();
+  LS.set("dbx_access", { token: tok.access_token, exp: Date.now() + (tok.expires_in - 60) * 1000 });
+  return tok.access_token;
+}
+
+function isConnected() { return !!LS.get("dbx_refresh", null); }
+function disconnect() { LS.del("dbx_refresh"); LS.del("dbx_access"); render(); }
+
+/* ---------- Dropbox API with rate-limit backoff ---------- */
+async function dbxFetch(url, options, attempt = 0) {
+  const res = await fetch(url, options);
+  if (res.status === 429 && attempt < 5) {
+    const retry = parseInt(res.headers.get("Retry-After") || "2", 10);
+    setStatus(`Rate limited by Dropbox — waiting ${retry}s…`);
+    await new Promise((r) => setTimeout(r, retry * 1000));
+    return dbxFetch(url, options, attempt + 1);
+  }
+  return res;
+}
+
+async function listSharedLink(url, token) {
+  // Walk an entire shared folder tree recursively (few paginated calls total).
+  const entries = [];
+  let body = { path: "", shared_link: { url }, recursive: true, include_deleted: false };
+  let endpoint = "https://api.dropboxapi.com/2/files/list_folder";
+  while (true) {
+    const res = await dbxFetch(endpoint, {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+    const data = await res.json();
+    entries.push(...data.entries);
+    if (!data.has_more) break;
+    endpoint = "https://api.dropboxapi.com/2/files/list_folder/continue";
+    body = { cursor: data.cursor };
+  }
+  return entries;
+}
+
+// Escape non-ASCII for the Dropbox-API-Arg header (required by Dropbox).
+function httpHeaderSafe(s) {
+  return s.replace(/[-￿]/g, (c) => "\\u" + ("0000" + c.charCodeAt(0).toString(16)).slice(-4));
+}
+async function downloadFile(linkUrl, path, filename, token) {
+  const res = await dbxFetch("https://content.dropboxapi.com/2/sharing/get_shared_link_file", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + token,
+      "Dropbox-API-Arg": httpHeaderSafe(JSON.stringify({ url: linkUrl, path })),
+    },
+  });
+  if (!res.ok) { alert("Download failed: " + (await res.text())); return; }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+
+/* ---------- grouping: build per-subfolder summary from recursive entries ---------- */
+function summarize(entries) {
+  // Group files by their top-level subfolder (relative to the shared root).
+  const folders = new Map(); // key -> {name, newest, files:[]}
+  const ensure = (name) => {
+    if (!folders.has(name)) folders.set(name, { name, newest: null, files: [] });
+    return folders.get(name);
+  };
+  for (const e of entries) {
+    if (e[".tag"] !== "file") continue;
+    const rel = (e.path_display || "").replace(/^\/+/, ""); // "Sub/dir/file.stl"
+    const parts = rel.split("/");
+    const top = parts.length > 1 ? parts[0] : "(files in root)";
+    const f = ensure(top);
+    const modified = e.server_modified;
+    f.files.push({ name: parts[parts.length - 1], path: e.path_display, modified, size: e.size });
+    if (!f.newest || modified > f.newest) f.newest = modified;
+  }
+  // also surface empty subfolders (folder entries directly under root)
+  for (const e of entries) {
+    if (e[".tag"] !== "folder") continue;
+    const rel = (e.path_display || "").replace(/^\/+/, "");
+    if (rel && !rel.includes("/") && !folders.has(rel)) ensure(rel);
+  }
+  for (const f of folders.values()) f.files.sort((a, b) => (b.modified || "").localeCompare(a.modified || ""));
+  return [...folders.values()];
+}
+
+/* ---------- state ---------- */
+const getLinks = () => LS.get("dbx_links", []);          // [{url, name}]
+const getSeen = () => LS.get("dbx_seen", {});            // { "url::folder": iso }
+const seenKey = (url, folder) => `${url}::${folder}`;
+
+function setStatus(msg, isError = false) {
+  const el = $("status");
+  el.textContent = msg;
+  el.className = "status" + (isError ? " error" : "");
+}
+
+/* ---------- main refresh ---------- */
+let lastResults = []; // [{link, folders:[...]}]
+
+async function refresh() {
+  const token = await getAccessToken();
+  if (!token) { render(); return; }
+  const links = getLinks();
+  if (!links.length) { setStatus("Add a shared link above to begin."); $("results").innerHTML = ""; return; }
+
+  $("refreshBtn").disabled = true;
+  setStatus("Checking Dropbox…");
+  lastResults = [];
+
+  // simple concurrency pool
+  const queue = [...links];
+  const errors = [];
+  async function worker() {
+    while (queue.length) {
+      const link = queue.shift();
+      try {
+        const entries = await listSharedLink(link.url, token);
+        lastResults.push({ link, folders: summarize(entries) });
+      } catch (e) {
+        errors.push(`${link.name || link.url}: ${e.message}`);
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(CONFIG.CONCURRENCY, links.length) }, worker));
+
+  LS.set("dbx_lastCheck", Date.now());
+  $("refreshBtn").disabled = false;
+  setStatus(errors.length ? "Some links failed:\n" + errors.join("\n") : "", errors.length > 0);
+  renderResults();
+  updateLastCheck();
+}
+
+/* ---------- rendering ---------- */
+function updateLastCheck() {
+  const t = LS.get("dbx_lastCheck", null);
+  $("lastCheck").textContent = t ? "Last checked: " + fmtDate(new Date(t).toISOString()) : "";
+}
+
+function renderSavedLinks() {
+  const wrap = $("savedLinks");
+  const links = getLinks();
+  wrap.innerHTML = links.length ? "" : '<span class="hint">No links added yet.</span>';
+  links.forEach((link, i) => {
+    const row = document.createElement("div");
+    row.className = "saved-link";
+    row.innerHTML = `<span>🔗</span><input class="linkname" data-i="${i}" type="text" value="${
+      (link.name || "").replace(/"/g, "&quot;")}" placeholder="Nickname (optional)"
+      style="flex:0 0 200px;background:transparent;border:none;color:var(--text)"/>
+      <span class="url">${link.url}</span>
+      <button class="ghost small" data-del="${i}">Remove</button>`;
+    wrap.appendChild(row);
+  });
+  wrap.querySelectorAll("[data-del]").forEach((b) =>
+    b.onclick = () => { const l = getLinks(); l.splice(+b.dataset.del, 1); LS.set("dbx_links", l); renderSavedLinks(); });
+  wrap.querySelectorAll(".linkname").forEach((inp) =>
+    inp.onchange = () => { const l = getLinks(); l[+inp.dataset.i].name = inp.value; LS.set("dbx_links", l); });
+}
+
+function renderResults() {
+  const seen = getSeen();
+  const results = $("results");
+  results.innerHTML = "";
+
+  // flatten to one list of folders across all links, newest first
+  const all = [];
+  for (const r of lastResults) {
+    for (const f of r.folders) {
+      const last = seen[seenKey(r.link.url, f.name)] || null;
+      const isNew = f.newest && (!last || f.newest > last);
+      all.push({ ...f, link: r.link, isNew, last });
+    }
+  }
+  all.sort((a, b) => (b.newest || "").localeCompare(a.newest || ""));
+
+  if (!all.length) { setStatus("No folders found in these links."); return; }
+
+  for (const f of all) {
+    const card = document.createElement("div");
+    card.className = "card" + (f.isNew ? " is-new" : "");
+    const filesHtml = f.files.map((file) => {
+      const fileNew = f.last ? file.modified > f.last : f.isNew;
+      return `<div class="file ${fileNew ? "is-new" : ""}">
+        <span class="fname">${fileNew ? "● " : ""}${file.name}</span>
+        <span class="fdate">${fmtDate(file.modified)}</span>
+        <button class="ghost small" data-dl='${encodeURIComponent(JSON.stringify(
+          { url: f.link.url, path: file.path, name: file.name }))}'>Download</button>
+      </div>`;
+    }).join("");
+
+    card.innerHTML = `
+      <div class="folder-head">
+        <span class="caret">▶</span>
+        <div>
+          <div><span class="folder-name">${f.name}</span> ${f.isNew ? '<span class="badge">NEW</span>' : ""}</div>
+          <div class="src">from ${f.link.name || f.link.url}</div>
+        </div>
+        <div class="meta">${f.files.length} file${f.files.length === 1 ? "" : "s"}<br>
+          <span>${f.newest ? "newest: " + fmtDate(f.newest) : "empty"}</span></div>
+      </div>
+      <div class="files">${filesHtml}</div>`;
+
+    const head = card.querySelector(".folder-head");
+    const files = card.querySelector(".files");
+    const caret = card.querySelector(".caret");
+    head.onclick = (ev) => {
+      if (ev.target.tagName === "BUTTON") return;
+      files.classList.toggle("open"); caret.classList.toggle("open");
+    };
+    card.querySelectorAll("[data-dl]").forEach((b) =>
+      b.onclick = async () => {
+        const d = JSON.parse(decodeURIComponent(b.dataset.dl));
+        b.disabled = true; b.textContent = "…";
+        const token = await getAccessToken();
+        await downloadFile(d.url, d.path, d.name, token);
+        b.disabled = false; b.textContent = "Download";
+      });
+    results.appendChild(card);
+  }
+}
+
+function markAllSeen() {
+  const seen = getSeen();
+  for (const r of lastResults)
+    for (const f of r.folders)
+      if (f.newest) seen[seenKey(r.link.url, f.name)] = f.newest;
+  LS.set("dbx_seen", seen);
+  renderResults();
+  setStatus("Marked everything as seen. Future changes will be highlighted.");
+}
+
+/* ---------- top-level render ---------- */
+function render() {
+  const configured = CONFIG.APP_KEY && CONFIG.APP_KEY !== "PASTE_YOUR_DROPBOX_APP_KEY";
+  $("setupNotice").style.display = configured ? "none" : "block";
+  const connected = isConnected();
+  $("authStatus").innerHTML = connected ? '<span class="connected"><span class="dot"></span>Connected</span>' : "";
+  $("connectBtn").textContent = connected ? "Disconnect" : "Connect Dropbox";
+  $("connectBtn").onclick = connected ? disconnect : startAuth;
+  $("connectBtn").disabled = !configured;
+
+  $("app").style.display = connected && configured ? "block" : "none";
+  $("signedOut").style.display = !connected && configured ? "block" : "none";
+
+  if (connected && configured) {
+    renderSavedLinks();
+    updateLastCheck();
+    if (lastResults.length) renderResults();
+  }
+}
+
+/* ---------- wire up + boot ---------- */
+$("addBtn").onclick = () => {
+  const url = $("linkInput").value.trim();
+  if (!url) return;
+  if (!/^https?:\/\/(www\.)?dropbox\.com\//i.test(url)) { setStatus("That doesn't look like a Dropbox link.", true); return; }
+  const links = getLinks();
+  if (links.some((l) => l.url === url)) { setStatus("That link is already added."); return; }
+  links.push({ url, name: "" });
+  LS.set("dbx_links", links);
+  $("linkInput").value = "";
+  renderSavedLinks();
+  setStatus('Link added. Click "Check for updates".');
+};
+$("linkInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("addBtn").click(); });
+$("refreshBtn").onclick = refresh;
+$("markSeenBtn").onclick = markAllSeen;
+
+(async function boot() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("code")) {
+    try {
+      setStatus("Finishing sign-in…");
+      await exchangeCode(params.get("code"));
+    } catch (e) {
+      setStatus(e.message, true);
+    }
+    // clean the ?code= out of the URL
+    window.history.replaceState({}, "", REDIRECT_URI);
+  }
+  render();
+  if (isConnected()) refresh();
+})();
+</script>
+</body>
+</html>

@@ -216,6 +216,21 @@ const fmtDate = (iso) => {
 };
 const esc = (s) => (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
+// Base URL for share/invite links — canonical (strip index.html) so the OAuth
+// redirect_uri still matches, then ?addFolder=<encoded dropbox url>.
+const shareBase = () => window.location.origin + window.location.pathname.replace(/index\.html$/i, "");
+const shareUrlFor = (dropboxUrl) => shareBase() + "?addFolder=" + encodeURIComponent(dropboxUrl);
+async function copyToClipboard(text) {
+  try { await navigator.clipboard.writeText(text); setStatus("Invite link copied to clipboard."); return; }
+  catch {}
+  const ta = document.createElement("textarea");
+  ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); setStatus("Invite link copied to clipboard."); }
+  catch { setStatus("Couldn't auto-copy. Here it is:\n" + text); }
+  ta.remove();
+}
+
 /* ---------- PKCE auth ---------- */
 function randomString(len) {
   const a = new Uint8Array(len);
@@ -571,9 +586,12 @@ function renderSavedLinks() {
     row.innerHTML = `<span>🔗</span><input class="linkname" data-i="${i}" type="text" value="${esc(link.name)}"
       placeholder="Nickname (optional)" style="flex:0 0 200px;background:transparent;border:none;color:var(--text)"/>
       <span class="url">${esc(link.url)}</span>
+      <button class="ghost small" data-copy="${i}" title="Copy a link that adds this folder for someone else">Copy invite</button>
       <button class="ghost small" data-del="${i}">Remove</button>`;
     wrap.appendChild(row);
   });
+  wrap.querySelectorAll("[data-copy]").forEach((b) =>
+    b.onclick = () => copyToClipboard(shareUrlFor(getLinks()[+b.dataset.copy].url)));
   wrap.querySelectorAll("[data-del]").forEach((b) =>
     b.onclick = () => { const l = getLinks(); l.splice(+b.dataset.del, 1); LS.set("dbx_links", l); renderSavedLinks(); });
   wrap.querySelectorAll(".linkname").forEach((inp) =>
@@ -732,26 +750,35 @@ function render() {
   }
 }
 
-/* ---------- wire up + boot ---------- */
-$("addBtn").onclick = async () => {
-  const url = $("linkInput").value.trim();
-  if (!url) return;
-  if (!/^https?:\/\/(www\.)?dropbox\.com\/(scl|sh)\//i.test(url)) {
-    setStatus("That doesn't look like a Dropbox shared link. Use Dropbox → Copy link (a /scl/ or /sh/ URL). A /home/ URL won't work.", true);
-    return;
-  }
+/* ---------- add a folder link (shared by the button and the ?addFolder= URL) ---------- */
+async function addFolderLink(url) {
+  url = (url || "").trim();
+  if (!/^https?:\/\/(www\.)?dropbox\.com\/(scl|sh)\//i.test(url)) return { added: false, reason: "invalid" };
   const links = getLinks();
-  if (links.some((l) => l.url === url)) { setStatus("That link is already added."); return; }
-  $("addBtn").disabled = true;
-  setStatus("Adding link…");
+  if (links.some((l) => l.url === url)) return { added: false, reason: "dup" };
   const token = await getAccessToken();
   const name = token ? await getSharedLinkName(url, token) : ""; // default nickname = folder name
   links.push({ url, name });
   LS.set("dbx_links", links);
-  $("linkInput").value = "";
+  return { added: true, name };
+}
+
+/* ---------- wire up + boot ---------- */
+$("addBtn").onclick = async () => {
+  const url = $("linkInput").value.trim();
+  if (!url) return;
+  $("addBtn").disabled = true;
+  setStatus("Adding link…");
+  const res = await addFolderLink(url);
   $("addBtn").disabled = false;
+  if (res.reason === "invalid") {
+    setStatus("That doesn't look like a Dropbox shared link. Use Dropbox → Copy link (a /scl/ or /sh/ URL). A /home/ URL won't work.", true);
+    return;
+  }
+  if (res.reason === "dup") { setStatus("That link is already added."); return; }
+  $("linkInput").value = "";
   renderSavedLinks();
-  setStatus(`Link added${name ? ` as "${name}"` : ""}. Click "Check for updates".`);
+  setStatus(`Link added${res.name ? ` as "${res.name}"` : ""}. Click "Check for updates".`);
 };
 $("linkInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("addBtn").click(); });
 $("refreshBtn").onclick = refresh;
@@ -759,17 +786,28 @@ $("markSeenBtn").onclick = markAllSeen;
 
 (async function boot() {
   const params = new URLSearchParams(window.location.search);
-  if (params.get("code")) {
+  const hadCode = !!params.get("code");
+  if (hadCode) {
     try { setStatus("Finishing sign-in…"); await exchangeCode(params.get("code")); }
     catch (e) { setStatus(e.message, true); }
-    window.history.replaceState({}, "", REDIRECT_URI);
   }
+  // ?addFolder=<encoded dropbox url> — auto-add the folder (skips duplicates)
+  let addedFromUrl = false;
+  const addParam = params.get("addFolder");
+  if (addParam) {
+    const res = await addFolderLink(addParam);
+    addedFromUrl = res.added;
+    if (res.added) setStatus(`Added folder${res.name ? ` "${res.name}"` : ""} from the invite link.`);
+    else if (res.reason === "dup") setStatus("That folder is already in your list.");
+    else if (res.reason === "invalid") setStatus("The invite link didn't contain a valid Dropbox folder link.", true);
+  }
+  if (hadCode || addParam) window.history.replaceState({}, "", REDIRECT_URI);
+
   loadFromCache();
   render();
-  // Don't auto-scan (can be slow for big libraries) — show cached results and
-  // let the user click "Check for updates".
-  if (isConnected() && !lastResults.length && getLinks().length) {
-    setStatus('Click "Check for updates" to scan your folders.');
+  if (isConnected()) {
+    if (addedFromUrl) refresh(); // auto-scan so the newly added folder shows up right away
+    else if (!lastResults.length && getLinks().length) setStatus('Click "Check for updates" to scan your folders.');
   }
 })();
 </script>

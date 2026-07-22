@@ -121,6 +121,10 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
   .progress-wrap { height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; margin: 8px 0; display: none; }
   .progress-bar { height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
+  select#linkFilter {
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    padding: 9px 10px; border-radius: 7px; font-size: 14px; max-width: 260px;
+  }
   .fh-main { flex: 1; min-width: 0; }
   .actions { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
   .act {
@@ -166,6 +170,7 @@
     <div class="row">
       <button id="refreshBtn">🔄 Check for updates</button>
       <button id="markSeenBtn" class="ghost">Mark all as seen</button>
+      <select id="linkFilter" title="Show only one Dropbox folder" style="display:none"></select>
       <div class="spacer"></div>
       <span class="hint" id="lastCheck"></span>
     </div>
@@ -215,6 +220,13 @@ const fmtDate = (iso) => {
   return `${d.toLocaleDateString()}${rel ? " (" + rel + ")" : ""}`;
 };
 const esc = (s) => (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const fmtSize = (n) => {
+  if (!n) return "";
+  const u = ["B", "KB", "MB", "GB"];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i > 0 && v < 10 ? v.toFixed(1) : Math.round(v)) + " " + u[i];
+};
 
 // Base URL for share/invite links — canonical (strip index.html) so the OAuth
 // redirect_uri still matches, then ?addFolder=<encoded dropbox url>.
@@ -333,13 +345,14 @@ async function getSharedLinkName(url, token) {
 // each TOP-LEVEL subfolder (searching all the way down). Returns folder records.
 async function scanLink(url, token, onProgress) {
   const root = await listChildren(url, "", token);
-  const records = [];
-  const rootFiles = [];
+  const records = [];      // folders (scanned below for their newest file)
+  const fileRecords = [];  // loose files in the root — listed alongside folders
   for (const e of root) {
     if (e[".tag"] === "folder") records.push({ name: e.name, path: "/" + e.name, newest: null });
-    else if (e[".tag"] === "file") rootFiles.push(e);
+    else if (e[".tag"] === "file")
+      fileRecords.push({ name: e.name, path: "/" + e.name, newest: e.server_modified, isFile: true, size: e.size });
   }
-  const queue = records.map((r) => ({ relPath: r.path, record: r }));
+  const queue = records.map((r) => ({ relPath: r.path, record: r })); // folders only
   let processed = 0, discovered = queue.length;
   async function worker() {
     while (queue.length) {
@@ -362,12 +375,7 @@ async function scanLink(url, token, onProgress) {
     }
   }
   await Promise.all(Array.from({ length: Math.min(CONFIG.SCAN_CONCURRENCY, queue.length || 1) }, worker));
-  if (rootFiles.length) {
-    let newest = null;
-    for (const f of rootFiles) if (!newest || f.server_modified > newest) newest = f.server_modified;
-    records.push({ name: "(files in root)", path: "", newest, isRoot: true });
-  }
-  return records;
+  return records.concat(fileRecords); // folders + root files, sorted together at render time
 }
 
 // Escape non-ASCII for the Dropbox-API-Arg header (required by Dropbox).
@@ -520,7 +528,8 @@ function hidePreview() { previewToken++; $("previewPop").style.display = "none";
 /* ---------- state ---------- */
 const getLinks = () => LS.get("dbx_links", []);            // [{url, name}]
 const getSeen = () => LS.get("dbx_seen", {});              // { "url::folder": iso }
-const getCache = () => LS.get("dbx_cache", {});            // { url: { scannedAt, folders:{name:newest} } }
+const getCache = () => LS.get("dbx_cache", {});            // { url: { scannedAt, folders:{name:{...}} } }
+const getFilter = () => LS.get("dbx_filter", "all");       // "all" or a specific link url
 const seenKey = (url, folder) => `${url}::${folder}`;
 let lastResults = [];   // [{ link, records:[{name,path,newest}] }]
 
@@ -556,7 +565,11 @@ async function refresh() {
         setStatus(`Scanning "${label}" (${i + 1}/${links.length}) — ${done}/${total} folders`);
       });
       lastResults.push({ link, records });
-      cache[link.url] = { scannedAt: Date.now(), folders: Object.fromEntries(records.map((r) => [r.name, { newest: r.newest, preview: r.preview || null }])) };
+      cache[link.url] = {
+        scannedAt: Date.now(),
+        folders: Object.fromEntries(records.map((r) => [r.name,
+          { newest: r.newest, preview: r.preview || null, isFile: !!r.isFile, size: r.size || 0 }])),
+      };
     } catch (e) {
       errors.push(`${label}: ${e.message}`);
     }
@@ -595,14 +608,33 @@ function renderSavedLinks() {
   wrap.querySelectorAll("[data-del]").forEach((b) =>
     b.onclick = () => { const l = getLinks(); l.splice(+b.dataset.del, 1); LS.set("dbx_links", l); renderSavedLinks(); });
   wrap.querySelectorAll(".linkname").forEach((inp) =>
-    inp.onchange = () => { const l = getLinks(); l[+inp.dataset.i].name = inp.value; LS.set("dbx_links", l); });
+    inp.onchange = () => {
+      const l = getLinks(); l[+inp.dataset.i].name = inp.value; LS.set("dbx_links", l); updateFilterUI();
+    });
+  updateFilterUI();
+}
+
+// Optional per-link view: only meaningful once more than one link is tracked.
+function updateFilterUI() {
+  const sel = $("linkFilter"), links = getLinks();
+  if (links.length < 2) { sel.style.display = "none"; return; }
+  sel.style.display = "";
+  const cur = getFilter();
+  sel.innerHTML = '<option value="all">All folders</option>' +
+    links.map((l) => `<option value="${esc(l.url)}">${esc(l.name || l.url)}</option>`).join("");
+  const valid = cur === "all" || links.some((l) => l.url === cur);
+  sel.value = valid ? cur : "all";
+  if (!valid) LS.set("dbx_filter", "all");
 }
 
 function renderResults() {
   const seen = getSeen(), results = $("results");
+  const filter = getFilter();
   results.innerHTML = "";
+  const shown = lastResults.filter((r) => filter === "all" || r.link.url === filter);
+  const showSrc = shown.length > 1;
   const all = [];
-  for (const r of lastResults)
+  for (const r of shown)
     for (const f of r.records) {
       const last = seen[seenKey(r.link.url, f.name)] || null;
       const isNew = f.newest && (!last || f.newest > last);
@@ -610,24 +642,52 @@ function renderResults() {
     }
   all.sort((a, b) => (b.newest || "").localeCompare(a.newest || ""));
 
-  if (!all.length) { setStatus('No folders found. Click "Check for updates" to scan.'); return; }
+  if (!all.length) { setStatus('Nothing to show. Click "Check for updates" to scan.'); return; }
 
   const newCount = all.filter((f) => f.isNew).length;
-  if (newCount) setStatus(`${newCount} folder${newCount === 1 ? "" : "s"} updated since you last marked as seen.`);
+  if (newCount) setStatus(`${newCount} item${newCount === 1 ? "" : "s"} updated since you last marked as seen.`);
 
   for (const f of all) {
     const card = document.createElement("div");
     card.className = "card" + (f.isNew ? " is-new" : "");
+    const badge = f.isNew ? '<span class="badge">NEW</span>' : "";
+    const src = showSrc ? `<div class="src">from ${esc(f.link.name || f.link.url)}</div>` : "";
+
+    // A loose file sitting in the link's root — no expanding, just download.
+    if (f.isFile) {
+      card.innerHTML = `
+        <div class="folder-head">
+          <span class="caret" style="visibility:hidden">▶</span>
+          <div class="fh-main">
+            <div><span class="folder-name">📄 ${esc(f.name)}</span> ${badge}</div>
+            ${src}
+          </div>
+          <div class="meta">${fmtDate(f.newest)}${f.size ? " · " + fmtSize(f.size) : ""}</div>
+          <div class="actions">
+            <button class="act dl-btn" title="Download this file">Download ⬇</button>
+          </div>
+        </div>`;
+      const dl = card.querySelector(".dl-btn");
+      dl.addEventListener("click", async (ev) => {
+        ev.stopPropagation();
+        const o = dl.textContent; dl.disabled = true; dl.textContent = "…";
+        await downloadFile(f.link.url, f.path, f.name, await getAccessToken());
+        dl.disabled = false; dl.textContent = o;
+      });
+      results.appendChild(card);
+      continue;
+    }
+
     card.innerHTML = `
       <div class="folder-head">
         <span class="caret">▶</span>
         <div class="fh-main">
-          <div><span class="folder-name">${esc(f.name)}</span> ${f.isNew ? '<span class="badge">NEW</span>' : ""}</div>
-          ${lastResults.length > 1 ? `<div class="src">from ${esc(f.link.name || f.link.url)}</div>` : ""}
+          <div><span class="folder-name">📁 ${esc(f.name)}</span> ${badge}</div>
+          ${src}
         </div>
         <div class="meta">${f.newest ? "newest: " + fmtDate(f.newest) : "no files"}</div>
         <div class="actions">
-          ${f.isRoot ? "" : '<button class="act zip-btn" title="Zip and download the contents of this folder">Zip ⬇</button>'}
+          <button class="act zip-btn" title="Zip and download the contents of this folder">Zip ⬇</button>
           ${f.preview ? '<button class="act preview-btn">Preview</button>' : ""}
         </div>
       </div>
@@ -706,9 +766,11 @@ async function renderChildren(container, url, path, seenIso, depth = 0) {
 }
 
 function markAllSeen() {
-  const seen = getSeen();
-  for (const r of lastResults)
+  const seen = getSeen(), filter = getFilter();
+  for (const r of lastResults) {
+    if (filter !== "all" && r.link.url !== filter) continue; // only what's currently shown
     for (const f of r.records) if (f.newest) seen[seenKey(r.link.url, f.name)] = f.newest;
+  }
   LS.set("dbx_seen", seen);
   renderResults();
   setStatus("Marked everything as seen. Future changes will be highlighted.");
@@ -721,13 +783,15 @@ function loadFromCache() {
   for (const link of links) {
     const c = cache[link.url];
     if (!c) continue;
-    const records = Object.entries(c.folders).map(([name, v]) => {
-      const val = typeof v === "string" ? { newest: v } : (v || {});
-      return {
-        name, newest: val.newest || null, preview: val.preview || null,
-        path: name === "(files in root)" ? "" : "/" + name, isRoot: name === "(files in root)",
-      };
-    });
+    const records = Object.entries(c.folders)
+      .filter(([name]) => name !== "(files in root)") // drop the old bucket from stale caches
+      .map(([name, v]) => {
+        const val = typeof v === "string" ? { newest: v } : (v || {});
+        return {
+          name, newest: val.newest || null, preview: val.preview || null,
+          isFile: !!val.isFile, size: val.size || 0, path: "/" + name,
+        };
+      });
     lastResults.push({ link, records });
   }
 }
@@ -783,6 +847,7 @@ $("addBtn").onclick = async () => {
 $("linkInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("addBtn").click(); });
 $("refreshBtn").onclick = refresh;
 $("markSeenBtn").onclick = markAllSeen;
+$("linkFilter").onchange = () => { LS.set("dbx_filter", $("linkFilter").value); renderResults(); };
 
 (async function boot() {
   const params = new URLSearchParams(window.location.search);
